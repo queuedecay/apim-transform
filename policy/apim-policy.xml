@@ -190,7 +190,7 @@
             "end_turn" => "stop",
             "stop_sequence" => "stop",
             "max_tokens" => "length",
-            "tool_use" => "tool_calls",
+            "tool_use" => "stop",
             _ => "stop"
         };
 
