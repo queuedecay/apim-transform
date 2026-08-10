@@ -165,9 +165,12 @@
 
     <!-- Anthropic -> OpenAI Chat Completions transform -->
     <set-body>@{
-        var aResp = context.Response.Body.As<JObject>(preserveContent: true);
-        var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var statusCode = context.Response.StatusCode;
+        var rawBody = context.Response.Body.As<string>(preserveContent: true);
+        if (statusCode >= 400) return rawBody;
 
+        var aResp = JObject.Parse(rawBody);
+        var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var textParts = new List<string>();
         if (aResp["content"] is JArray contentArr)
         {
