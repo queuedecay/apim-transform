@@ -1,0 +1,262 @@
+<policies>
+  <inbound>
+    <base />
+
+    <!-- 1) Correlation ID handling -->
+    <set-variable name="correlationId" value="@{
+        var incoming = context.Request.Headers.GetValueOrDefault("X-Correlation-Id", "");
+        return string.IsNullOrWhiteSpace(incoming) ? context.RequestId.ToString() : incoming;
+    }" />
+    <set-header name="X-Correlation-Id" exists-action="override">
+      <value>@((string)context.Variables["correlationId"])</value>
+    </set-header>
+
+    <!-- 2) OpenAI -> Anthropic transform -->
+    <set-variable name="frontendModel" value="@{
+        var req = context.Request.Body.As<JObject>(preserveContent: true);
+        return (string?)req["model"] ?? "claude-via-gateway";
+    }" />
+
+    <!-- Optional guard: phase-1 non-streaming only -->
+    <choose>
+      <when condition="@{
+          var req = context.Request.Body.As<JObject>(preserveContent: true);
+          return (bool?)req["stream"] == true;
+      }">
+        <return-response>
+          <set-status code="400" reason="Bad Request" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-header name="X-Correlation-Id" exists-action="override">
+            <value>@((string)context.Variables["correlationId"])</value>
+          </set-header>
+          <set-body>@{
+              var body = new JObject(
+                  new JProperty("error", new JObject(
+                      new JProperty("message", "stream=true is not enabled on this gateway route."),
+                      new JProperty("type", "invalid_request_error"),
+                      new JProperty("code", "stream_not_supported"),
+                      new JProperty("correlation_id", (string)context.Variables["correlationId"])
+                  ))
+              );
+              return body.ToString();
+          }</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <set-body>@{
+        var oReq = context.Request.Body.As<JObject>(preserveContent: true);
+        var aReq = new JObject();
+
+        aReq["model"] = "{{foundry-claude-model-or-deployment}}";
+        aReq["max_tokens"] = (int?)oReq["max_tokens"] ?? 1024;
+
+        if (oReq["temperature"] != null) aReq["temperature"] = oReq["temperature"];
+        if (oReq["top_p"] != null) aReq["top_p"] = oReq["top_p"];
+
+        if (oReq["stop"] != null)
+        {
+            if (oReq["stop"] is JArray stopArr)
+            {
+                aReq["stop_sequences"] = stopArr;
+            }
+            else
+            {
+                aReq["stop_sequences"] = new JArray(oReq["stop"]);
+            }
+        }
+
+        var sourceMessages = (JArray?)oReq["messages"] ?? new JArray();
+        var targetMessages = new JArray();
+        var systemParts = new List<string>();
+
+        foreach (var token in sourceMessages)
+        {
+            if (token is not JObject m) continue;
+
+            var role = ((string?)m["role"] ?? "user").ToLowerInvariant();
+            var content = m["content"];
+
+            string flattenToText(JToken? t)
+            {
+                if (t == null) return string.Empty;
+                if (t.Type == JTokenType.String) return (string)t;
+                if (t is JArray arr)
+                {
+                    var chunks = new List<string>();
+                    foreach (var c in arr)
+                    {
+                        if (c is JObject cObj)
+                        {
+                            var type = ((string?)cObj["type"] ?? "").ToLowerInvariant();
+                            if (type == "text" && cObj["text"] != null) chunks.Add((string)cObj["text"]);
+                        }
+                        else if (c.Type == JTokenType.String)
+                        {
+                            chunks.Add((string)c);
+                        }
+                    }
+                    return string.Join("\n", chunks.Where(x => !string.IsNullOrWhiteSpace(x)));
+                }
+                return t.ToString();
+            }
+
+            if (role == "system")
+            {
+                var systemText = flattenToText(content);
+                if (!string.IsNullOrWhiteSpace(systemText)) systemParts.Add(systemText);
+                continue;
+            }
+
+            var mappedRole = role == "assistant" ? "assistant" : "user";
+            var outMessage = new JObject
+            {
+                ["role"] = mappedRole,
+                ["content"] = new JArray(
+                    new JObject
+                    {
+                        ["type"] = "text",
+                        ["text"] = flattenToText(content)
+                    }
+                )
+            };
+            targetMessages.Add(outMessage);
+        }
+
+        if (systemParts.Count > 0)
+        {
+            aReq["system"] = string.Join("\n\n", systemParts);
+        }
+        aReq["messages"] = targetMessages;
+
+        return aReq.ToString();
+    }</set-body>
+
+    <!-- 3) Backend auth + routing -->
+    <set-header name="anthropic-version" exists-action="override">
+      <value>2023-06-01</value>
+    </set-header>
+    <set-header name="x-api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+
+    <!-- If your Foundry backend uses Entra auth -->
+    <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+
+    <!-- Backend should point at your Foundry Claude endpoint root -->
+    <set-backend-service backend-id="foundry-claude-backend" />
+    <rewrite-uri template="/v1/messages" copy-unmatched-params="false" />
+  </inbound>
+
+  <backend>
+    <base />
+    <forward-request timeout="120" />
+  </backend>
+
+  <outbound>
+    <base />
+
+    <set-header name="X-Correlation-Id" exists-action="override">
+      <value>@((string)context.Variables["correlationId"])</value>
+    </set-header>
+
+    <!-- Anthropic -> OpenAI Chat Completions transform -->
+    <set-body>@{
+        var statusCode = context.Response.StatusCode;
+        var rawBody = context.Response.Body.As<string>(preserveContent: true);
+        if (statusCode >= 400) return rawBody;
+
+        var aResp = JObject.Parse(rawBody);
+        var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var textParts = new List<string>();
+        if (aResp["content"] is JArray contentArr)
+        {
+            foreach (var c in contentArr)
+            {
+                if (c is JObject cObj)
+                {
+                    var type = ((string?)cObj["type"] ?? "").ToLowerInvariant();
+                    if (type == "text" && cObj["text"] != null)
+                    {
+                        textParts.Add((string)cObj["text"]);
+                    }
+                }
+            }
+        }
+
+        var stopReason = ((string?)aResp["stop_reason"] ?? "").ToLowerInvariant();
+        var finishReason = stopReason switch
+        {
+            "end_turn" => "stop",
+            "stop_sequence" => "stop",
+            "max_tokens" => "length",
+            "tool_use" => "stop",
+            _ => "stop"
+        };
+
+        var usage = aResp["usage"] as JObject ?? new JObject();
+        var promptTokens = (int?)usage["input_tokens"] ?? 0;
+        var completionTokens = (int?)usage["output_tokens"] ?? 0;
+
+        var oResp = new JObject
+        {
+            ["id"] = (string?)aResp["id"] ?? ("chatcmpl-" + Guid.NewGuid().ToString("N")),
+            ["object"] = "chat.completion",
+            ["created"] = created,
+            ["model"] = (string?)context.Variables["frontendModel"] ?? "claude-via-gateway",
+            ["choices"] = new JArray(
+                new JObject
+                {
+                    ["index"] = 0,
+                    ["message"] = new JObject
+                    {
+                        ["role"] = "assistant",
+                        ["content"] = string.Join("\n", textParts)
+                    },
+                    ["finish_reason"] = finishReason
+                }
+            ),
+            ["usage"] = new JObject
+            {
+                ["prompt_tokens"] = promptTokens,
+                ["completion_tokens"] = completionTokens,
+                ["total_tokens"] = promptTokens + completionTokens
+            }
+        };
+
+        return oResp.ToString();
+    }</set-body>
+    <set-header name="Content-Type" exists-action="override">
+      <value>application/json</value>
+    </set-header>
+  </outbound>
+
+  <on-error>
+    <base />
+    <set-header name="X-Correlation-Id" exists-action="override">
+      <value>@((string)context.Variables.GetValueOrDefault("correlationId", context.RequestId.ToString()))</value>
+    </set-header>
+    <return-response>
+      <set-status code="502" reason="Bad Gateway" />
+      <set-header name="Content-Type" exists-action="override">
+        <value>application/json</value>
+      </set-header>
+      <set-body>@{
+          var correlation = (string?)context.Variables.GetValueOrDefault("correlationId", context.RequestId.ToString());
+          var err = context.LastError;
+          var body = new JObject(
+              new JProperty("error", new JObject(
+                  new JProperty("message", "Gateway transformation or backend call failed."),
+                  new JProperty("type", "gateway_error"),
+                  new JProperty("code", err?.Reason ?? "apim_error"),
+                  new JProperty("source", err?.Source ?? "apim"),
+                  new JProperty("policy_section", err?.Section ?? "unknown"),
+                  new JProperty("correlation_id", correlation)
+              ))
+          );
+          return body.ToString();
+      }</set-body>
+    </return-response>
+  </on-error>
+</policies>
