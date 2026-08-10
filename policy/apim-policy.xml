@@ -50,9 +50,7 @@
         var oReq = context.Request.Body.As<JObject>(preserveContent: true);
         var aReq = new JObject();
 
-        // Model routing: map frontend model to backend Claude model/deployment.
-        // Replace this with your own lookup logic if needed.
-        aReq["model"] = "<FOUNDRY_CLAUDE_MODEL_OR_DEPLOYMENT>";
+        aReq["model"] = "{{foundry-claude-model-or-deployment}}";
         aReq["max_tokens"] = (int?)oReq["max_tokens"] ?? 1024;
 
         if (oReq["temperature"] != null) aReq["temperature"] = oReq["temperature"];
